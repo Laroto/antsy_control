@@ -9,6 +9,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "actuator_msgs/msg/actuators.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 #include "kdl/frames.hpp"
 #include "kdl/jntarray.hpp"
 
@@ -79,25 +80,45 @@ public:
       this->create_publisher<antsy_msgs::msg::GaitPhase>(
         "gait_phase_right", 10);
 
+    joint_state_sub_ = 
+      this->create_subscription<sensor_msgs::msg::JointState>(
+      "joint_states", 10, std::bind(&FollowVelocity::jointStateCallback, this, _1));
+
+    spinUntilInitialized();
+
     // Initialize legs
     legs_.resize(nb_legs_);
+    
     for (int i = 0; i < nb_legs_; i++) {
-      legs_[i].foot_center_position.x(
-        (i == 0 || i == 5 ? 0.18 : 0.00) + (i == 2 || i == 3 ? -0.18 : 0.00));
-      legs_[i].foot_center_position.y(
-        (i == 1 || i == 4 ? 0.27 : 0.20) * (i < 3 ? 1 : -1));
-      legs_[i].foot_center_position.z(0);
-      legs_[i].foot_relative_position.x(0);
-      legs_[i].foot_relative_position.y(0);
-      legs_[i].foot_relative_position.z((i % 2) ? pzmin_ : pzmax_);
+      legs_[i].foot_center_position = KDL::Vector(
+        real_joint_state_.position[i * nb_joints_per_leg_],
+        real_joint_state_.position[i * nb_joints_per_leg_ + 1],
+        real_joint_state_.position[i * nb_joints_per_leg_ + 2]
+      );
+      legs_[i].foot_relative_position = KDL::Vector(0, 0, (i % 2) ? pzmin_ : pzmax_);
       legs_[i].joint_angles = KDL::JntArray(nb_joints_per_leg_);
-      // IK solver initialization
-      legs_[i].joint_angles(0) = 0;
-      legs_[i].joint_angles(1) = 0.1 * (i < 3 ? 1 : -1);
-      legs_[i].joint_angles(1) = -1.5 * (i < 3 ? 1 : -1);
+      for (int j = 0; j < nb_joints_per_leg_; j++) {
+      legs_[i].joint_angles(j) = real_joint_state_.position[i * nb_joints_per_leg_ + j];
+      }
     }
-    left_phase_ = GaitPhase::DOWN;
-    right_phase_ = GaitPhase::UP;
+
+    // for (int i = 0; i < nb_legs_; i++) {
+    //   legs_[i].foot_center_position.x(
+    //     (i == 0 || i == 5 ? 0.18 : 0.00) + (i == 2 || i == 3 ? -0.18 : 0.00));
+    //   legs_[i].foot_center_position.y(
+    //     (i == 1 || i == 4 ? 0.27 : 0.20) * (i < 3 ? 1 : -1));
+    //   legs_[i].foot_center_position.z(0);
+    //   legs_[i].foot_relative_position.x(0);
+    //   legs_[i].foot_relative_position.y(0);
+    //   legs_[i].foot_relative_position.z((i % 2) ? pzmin_ : pzmax_);
+    //   legs_[i].joint_angles = KDL::JntArray(nb_joints_per_leg_);
+    //   // IK solver initialization
+    //   legs_[i].joint_angles(0) = 0;
+    //   legs_[i].joint_angles(1) = 0.1 * (i < 3 ? 1 : -1);
+    //   legs_[i].joint_angles(1) = -1.5 * (i < 3 ? 1 : -1);
+    // }
+    // left_phase_ = GaitPhase::DOWN;
+    // right_phase_ = GaitPhase::UP;
 
     // Start listening to URDF, create KDL tree,
     // extract chains and construct a solver for each
@@ -108,7 +129,8 @@ public:
 
     // Main timer callback, which moves the legs
     timer_ = this->create_wall_timer(
-      20ms, std::bind(&FollowVelocity::timerCallback, this));
+      std::chrono::milliseconds(static_cast<int>(control_period_ms_)), 
+      std::bind(&FollowVelocity::timerCallback, this));
     last_start_ = this->now();
 
   }
@@ -139,7 +161,7 @@ private:
     return KDL::Frame(constrained_rotation, frame.p);
   }
 
-  void cmdVelCallback(const geometry_msgs::msg::TwistStamped & msg)
+  void cmdVelCallback(const geometry_msgs::msg::TwistStamped& msg)
   {
     cmd_vel_.vel.x(msg.twist.linear.x);
     cmd_vel_.vel.y(msg.twist.linear.y);
@@ -150,8 +172,13 @@ private:
     cmd_vel_stamp_ = msg.header.stamp;
   }
 
+  void jointStateCallback(const sensor_msgs::msg::JointState& msg)
+  {
+    real_joint_state_ = msg;
+  }
+
   void timerCallback()
-{
+  {
   const rclcpp::Time now = this->now();
   // If velocity reference too old, don't do anything
   const double cmd_vel_oldness = (now - cmd_vel_stamp_).seconds();
@@ -163,13 +190,23 @@ private:
     return;
   }
 
+  void spinUntilInitialized()
+  {
+    while (real_joint_state_.name.empty()) {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        "CONTROL: Waiting for motor reading.");
+      rclcpp::sleep_for(std::chrono::milliseconds(100));
+      rclcpp::spin_some(this->get_node_base_interface());
+    }
+  }
+
   // Don't change velocity if any leg in phase FALLING
   const bool falling =
     left_phase_ == GaitPhase::FALLING || right_phase_ == GaitPhase::FALLING;
   if (!falling) cmd_vel_smoothed_ = cmd_vel_;
 
   // Timestep
-  const double dt = 20e-3;
+  const double dt = control_period_ms_ * 1e-3;
   const double duration_vertical = (pzmax_ - pzmin_) / vzmax_;
 
   // Velocity of each foot
@@ -327,7 +364,7 @@ private:
   phase_right_msg.header.stamp = now;
   phase_right_msg.phase = static_cast<uint8_t>(right_phase_);
   gait_phase_right_pub_->publish(phase_right_msg);
-}
+  }
 
   rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr
     cmd_vel_sub_;
@@ -341,6 +378,10 @@ private:
     gait_phase_left_pub_;
   rclcpp::Publisher<antsy_msgs::msg::GaitPhase>::SharedPtr
     gait_phase_right_pub_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
+    joint_state_sub_; 
+
+  sensor_msgs::msg::JointState real_joint_state_;
 
   rclcpp::TimerBase::SharedPtr timer_;
   std::shared_ptr<antsy_kinematics::Kinematics> kinematics_;
@@ -361,17 +402,20 @@ private:
 
   // Hardware parameters
   // TODO derive those from properties.urdf.xacro
-  static constexpr double pxmax_ = 0.045;
-  static constexpr double pymax_ = 0.035;
-  static constexpr double pzmin_ = -0.100;
-  static constexpr double pzmax_ = -0.070;
-  static constexpr double pzsync_ = -0.090;
-  static constexpr double vxmax_ = 0.67;
-  static constexpr double vymax_ = 0.34;
-  static constexpr double vzmax_ = 0.34 * 2/3;
+  static constexpr double pxmax_ = 0.075; // 0.045 m
+  static constexpr double pymax_ = 0.050; // 0.035 m
+  static constexpr double pzmin_ = -0.100; // -0.100 m
+  static constexpr double pzmax_ = -0.070; // -0.070 m
+  static constexpr double pzsync_ = -0.090; // -0.090 m
+  static constexpr double vxmax_ = 0.55; // 0.67 m/s
+  static constexpr double vymax_ = 0.28; // 0.34 m/s
+  static constexpr double vzmax_ = 0.28 * 2/3; // 0.34 m/s
   // TODO support other values than 6
   static const int nb_legs_ = 6;
   static const int nb_joints_per_leg_ = 3;
+
+  static const int control_frequency_hz_ = 50;
+  static constexpr double control_period_ms_ = 1.0 / control_frequency_hz_ * 1e3;
 };
 
 int main(int argc, char * argv[])
