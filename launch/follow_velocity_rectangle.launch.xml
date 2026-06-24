@@ -1,5 +1,8 @@
 <launch>
+  <arg name="use_sim_time" default="true" />
+
   <node pkg="antsy_control" exec="follow_velocity_rectangle" name="follow_velocity_rectangle" output="screen">
-    <param name="use_sim_time" value="true" />
+    <param name="use_sim_time" value="$(var use_sim_time)" />
+    <param from="$(find-pkg-share antsy_control)/config/follow_velocity_rectangle.yaml" />
   </node>
 </launch>

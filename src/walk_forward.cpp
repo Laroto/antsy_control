@@ -9,8 +9,10 @@
 #include "kdl/jntarray.hpp"
 
 #include "antsy_kinematics/kinematics.hpp"
+#include "std_msgs/msg/string.hpp"
 
 using namespace std::chrono_literals;
+using namespace std::placeholders;
 
 struct TrajectoryPose {
   double t;
@@ -72,7 +74,18 @@ public:
     // extract chains and construct a solver for each
     kinematics_ = std::make_shared<antsy_kinematics::Kinematics>(
       std::vector<std::string>{"foot_0", "foot_1", "foot_2", "foot_3", "foot_4", "foot_5"});
-    kinematics_->spinUntilInitialized();
+    // Forward robot_description to kinematics helper from this node
+    robot_description_sub_ = this->create_subscription<std_msgs::msg::String>(
+      "robot_description",
+      rclcpp::QoS(rclcpp::KeepLast(1)).durability(RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL),
+      std::bind(&antsy_kinematics::Kinematics::robotDescriptionCallback, kinematics_.get(), _1));
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+      "IK: Waiting until URDF received and solvers initialized.");
+    while (!kinematics_->isInitialized()) {
+      rclcpp::spin_some(this->get_node_base_interface());
+      rclcpp::sleep_for(std::chrono::milliseconds(100));
+    }
   }
 private:
   void timerCallback()
@@ -144,6 +157,7 @@ private:
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<actuator_msgs::msg::Actuators>::SharedPtr publisher_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_description_sub_;
   std::shared_ptr<antsy_kinematics::Kinematics> kinematics_;
   rclcpp::Time last_start_;
   std::vector<KDL::JntArray> joint_angles_;

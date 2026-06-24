@@ -1,0 +1,32 @@
+/**:
+  ros__parameters:
+    cmd_vel_timeout: 0.3
+
+    control:
+      period: 0.02
+      max_dt: 0.05
+
+    gait:
+      # Tripod gait foot travel relative to each neutral foot position.
+      step_limit_x: 0.045
+      step_limit_y: 0.035
+      foot_z_down: -0.100
+      foot_z_up: -0.070
+      foot_z_sync: -0.090
+
+      # Stance-foot speed limits used to scale requested body velocity.
+      max_velocity_ratio: 0.50
+      stance_velocity_x: 0.67
+      stance_velocity_y: 0.34
+      vertical_velocity: 0.2266666667
+
+      # Swing and idle recovery speeds.
+      swing_xy_velocity: 0.55
+      idle_return_velocity: 0.25
+      velocity_epsilon: 0.00001
+
+    ik:
+      position_weight: 1.0
+      orientation_weight: 0.0
+      seed_joint_angles_left: [0.0, 0.6, 1.8]
+      seed_joint_angles_right: [0.0, -0.6, -1.8]
