@@ -874,7 +874,7 @@ private:
   double current_yaw_rate_ = 0.0;
   bool heading_hold_active_ = false;
   double heading_hold_yaw_ = 0.0;
-  bool body_pose_mode_enabled_ = true;
+  bool body_pose_mode_enabled_ = false;
   KDL::Twist body_pose_current_;
   // Phases of the two front feet
   // alternating feet are in phase
