@@ -11,6 +11,7 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(actuator_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(orocos_kdl_vendor REQUIRED)
 find_package(antsy_kinematics REQUIRED)
 find_package(antsy_msgs REQUIRED)
@@ -21,6 +22,7 @@ set(dependencies
   geometry_msgs
   sensor_msgs
   actuator_msgs
+  nav_msgs
   orocos_kdl_vendor
   antsy_kinematics
   antsy_msgs

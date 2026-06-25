@@ -9,6 +9,8 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "actuator_msgs/msg/actuators.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float64.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "kdl/frames.hpp"
@@ -46,12 +48,17 @@ public:
     loadParameters();
     cmd_vel_ = zeroTwist();
     cmd_vel_smoothed_ = zeroTwist();
+    body_pose_current_ = zeroTwist();
 
     // Listen to velocity setpoint
     cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(
       "cmd_vel", 10, std::bind(&FollowVelocity::cmdVelCallback, this, _1));
     cmd_vel_unstamped_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
       "cmd_vel_unstamped", 10, std::bind(&FollowVelocity::cmdVelUnstampedCallback, this, _1));
+    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      "odom", 10, std::bind(&FollowVelocity::odomCallback, this, _1));
+    body_pose_mode_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+      "body_pose_mode", 10, std::bind(&FollowVelocity::bodyPoseModeCallback, this, _1));
     // Publisher for joint angle references
     actuators_pub_ = this->create_publisher<actuator_msgs::msg::Actuators>(
       "actuators", 1);
@@ -163,6 +170,22 @@ private:
     double ik_orientation_weight;
     std::vector<double> ik_seed_joint_angles_left;
     std::vector<double> ik_seed_joint_angles_right;
+    bool heading_hold_enabled;
+    double heading_hold_kp;
+    double heading_hold_kd;
+    double heading_hold_max_angular_velocity;
+    double heading_hold_min_linear_velocity;
+    double heading_hold_angular_deadband;
+    double max_linear_acceleration;
+    double max_angular_acceleration;
+    double body_pose_max_x;
+    double body_pose_max_y;
+    double body_pose_max_z;
+    double body_pose_max_roll;
+    double body_pose_max_pitch;
+    double body_pose_max_yaw;
+    double body_pose_linear_rate;
+    double body_pose_angular_rate;
     double velocity_epsilon;
     double max_dt;
   };
@@ -205,6 +228,38 @@ private:
     params_.ik_seed_joint_angles_right =
       this->declare_parameter<std::vector<double>>(
         "ik.seed_joint_angles_right", std::vector<double>{0.0, -0.6, -1.8});
+    params_.heading_hold_enabled =
+      this->declare_parameter<bool>("heading_hold.enabled", true);
+    params_.heading_hold_kp =
+      this->declare_parameter<double>("heading_hold.kp", 1.8);
+    params_.heading_hold_kd =
+      this->declare_parameter<double>("heading_hold.kd", 0.30);
+    params_.heading_hold_max_angular_velocity =
+      this->declare_parameter<double>("heading_hold.max_angular_velocity", 0.40);
+    params_.heading_hold_min_linear_velocity =
+      this->declare_parameter<double>("heading_hold.min_linear_velocity", 0.02);
+    params_.heading_hold_angular_deadband =
+      this->declare_parameter<double>("heading_hold.angular_deadband", 0.02);
+    params_.max_linear_acceleration =
+      this->declare_parameter<double>("command_filter.max_linear_acceleration", 0.8);
+    params_.max_angular_acceleration =
+      this->declare_parameter<double>("command_filter.max_angular_acceleration", 2.0);
+    params_.body_pose_max_x =
+      this->declare_parameter<double>("body_pose.max_x", 0.030);
+    params_.body_pose_max_y =
+      this->declare_parameter<double>("body_pose.max_y", 0.025);
+    params_.body_pose_max_z =
+      this->declare_parameter<double>("body_pose.max_z", 0.020);
+    params_.body_pose_max_roll =
+      this->declare_parameter<double>("body_pose.max_roll", 0.18);
+    params_.body_pose_max_pitch =
+      this->declare_parameter<double>("body_pose.max_pitch", 0.18);
+    params_.body_pose_max_yaw =
+      this->declare_parameter<double>("body_pose.max_yaw", 0.22);
+    params_.body_pose_linear_rate =
+      this->declare_parameter<double>("body_pose.linear_rate", 0.10);
+    params_.body_pose_angular_rate =
+      this->declare_parameter<double>("body_pose.angular_rate", 0.70);
     params_.velocity_epsilon =
       this->declare_parameter<double>("gait.velocity_epsilon", 1e-5);
     params_.max_dt =
@@ -222,6 +277,21 @@ private:
       params_.ik_orientation_weight < 0.0 ||
       params_.ik_seed_joint_angles_left.size() != nb_joints_per_leg_ ||
       params_.ik_seed_joint_angles_right.size() != nb_joints_per_leg_ ||
+      params_.heading_hold_kp < 0.0 ||
+      params_.heading_hold_kd < 0.0 ||
+      params_.heading_hold_max_angular_velocity < 0.0 ||
+      params_.heading_hold_min_linear_velocity < 0.0 ||
+      params_.heading_hold_angular_deadband < 0.0 ||
+      params_.max_linear_acceleration <= 0.0 ||
+      params_.max_angular_acceleration <= 0.0 ||
+      params_.body_pose_max_x < 0.0 ||
+      params_.body_pose_max_y < 0.0 ||
+      params_.body_pose_max_z < 0.0 ||
+      params_.body_pose_max_roll < 0.0 ||
+      params_.body_pose_max_pitch < 0.0 ||
+      params_.body_pose_max_yaw < 0.0 ||
+      params_.body_pose_linear_rate <= 0.0 ||
+      params_.body_pose_angular_rate <= 0.0 ||
       params_.foot_z_up <= params_.foot_z_down)
     {
       throw std::runtime_error("Invalid follow_velocity gait parameters.");
@@ -264,6 +334,47 @@ private:
   void cmdVelUnstampedCallback(const geometry_msgs::msg::Twist & msg)
   {
     updateCmdVel(msg, this->now());
+  }
+
+  static double yawFromQuaternion(const geometry_msgs::msg::Quaternion & q)
+  {
+    const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+    const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+    return std::atan2(siny_cosp, cosy_cosp);
+  }
+
+  static double normalizeAngle(double angle)
+  {
+    while (angle > M_PI) {
+      angle -= 2.0 * M_PI;
+    }
+    while (angle < -M_PI) {
+      angle += 2.0 * M_PI;
+    }
+    return angle;
+  }
+
+  void odomCallback(const nav_msgs::msg::Odometry & msg)
+  {
+    current_yaw_ = yawFromQuaternion(msg.pose.pose.orientation);
+    current_yaw_rate_ = msg.twist.twist.angular.z;
+    has_odom_ = true;
+  }
+
+  void bodyPoseModeCallback(const std_msgs::msg::Bool & msg)
+  {
+    if (body_pose_mode_enabled_ == msg.data) {
+      return;
+    }
+
+    body_pose_mode_enabled_ = msg.data;
+    cmd_vel_smoothed_ = zeroTwist();
+    body_pose_current_ = zeroTwist();
+    heading_hold_active_ = false;
+    left_phase_ = GaitPhase::DOWN;
+    right_phase_ = GaitPhase::DOWN;
+    RCLCPP_INFO(
+      this->get_logger(), "Body pose mode %s.", body_pose_mode_enabled_ ? "enabled" : "disabled");
   }
 
   KDL::Twist zeroTwist() const
@@ -359,6 +470,123 @@ private:
     return false;
   }
 
+  bool translationCommandActive(const KDL::Twist & command) const
+  {
+    return std::hypot(command.vel.x(), command.vel.y()) >=
+      params_.heading_hold_min_linear_velocity;
+  }
+
+  KDL::Twist applyHeadingHold(const KDL::Twist & command)
+  {
+    KDL::Twist adjusted_command = command;
+    const bool can_hold_heading =
+      params_.heading_hold_enabled &&
+      has_odom_ &&
+      translationCommandActive(command) &&
+      std::abs(command.rot.z()) <= params_.heading_hold_angular_deadband;
+
+    if (!can_hold_heading) {
+      heading_hold_active_ = false;
+      return adjusted_command;
+    }
+
+    if (!heading_hold_active_) {
+      heading_hold_yaw_ = current_yaw_;
+      heading_hold_active_ = true;
+    }
+
+    const double yaw_error = normalizeAngle(heading_hold_yaw_ - current_yaw_);
+    const double correction = std::clamp(
+      params_.heading_hold_kp * yaw_error - params_.heading_hold_kd * current_yaw_rate_,
+      -params_.heading_hold_max_angular_velocity,
+      params_.heading_hold_max_angular_velocity);
+    adjusted_command.rot.z(command.rot.z() + correction);
+    return adjusted_command;
+  }
+
+  KDL::Twist limitCommandRate(
+    const KDL::Twist & current,
+    const KDL::Twist & target,
+    const double dt) const
+  {
+    KDL::Twist limited = current;
+    const double linear_step = params_.max_linear_acceleration * dt;
+    const double angular_step = params_.max_angular_acceleration * dt;
+
+    limited.vel.x(moveTowards(current.vel.x(), target.vel.x(), linear_step));
+    limited.vel.y(moveTowards(current.vel.y(), target.vel.y(), linear_step));
+    limited.vel.z(moveTowards(current.vel.z(), target.vel.z(), linear_step));
+    limited.rot.x(moveTowards(current.rot.x(), target.rot.x(), angular_step));
+    limited.rot.y(moveTowards(current.rot.y(), target.rot.y(), angular_step));
+    limited.rot.z(moveTowards(current.rot.z(), target.rot.z(), angular_step));
+    return limited;
+  }
+
+  double clampSymmetric(const double value, const double limit) const
+  {
+    return std::clamp(value, -limit, limit);
+  }
+
+  KDL::Twist bodyPoseTargetFromCommand(const bool cmd_vel_timed_out) const
+  {
+    if (cmd_vel_timed_out) {
+      return zeroTwist();
+    }
+
+    KDL::Twist target = zeroTwist();
+    target.vel.x(clampSymmetric(cmd_vel_.vel.x(), params_.body_pose_max_x));
+    target.vel.y(clampSymmetric(cmd_vel_.vel.y(), params_.body_pose_max_y));
+    target.vel.z(clampSymmetric(cmd_vel_.vel.z(), params_.body_pose_max_z));
+    target.rot.x(clampSymmetric(cmd_vel_.rot.x(), params_.body_pose_max_roll));
+    target.rot.y(clampSymmetric(cmd_vel_.rot.y(), params_.body_pose_max_pitch));
+    target.rot.z(clampSymmetric(cmd_vel_.rot.z(), params_.body_pose_max_yaw));
+    return target;
+  }
+
+  KDL::Twist limitBodyPoseRate(
+    const KDL::Twist & current,
+    const KDL::Twist & target,
+    const double dt) const
+  {
+    KDL::Twist limited = current;
+    const double linear_step = params_.body_pose_linear_rate * dt;
+    const double angular_step = params_.body_pose_angular_rate * dt;
+
+    limited.vel.x(moveTowards(current.vel.x(), target.vel.x(), linear_step));
+    limited.vel.y(moveTowards(current.vel.y(), target.vel.y(), linear_step));
+    limited.vel.z(moveTowards(current.vel.z(), target.vel.z(), linear_step));
+    limited.rot.x(moveTowards(current.rot.x(), target.rot.x(), angular_step));
+    limited.rot.y(moveTowards(current.rot.y(), target.rot.y(), angular_step));
+    limited.rot.z(moveTowards(current.rot.z(), target.rot.z(), angular_step));
+    return limited;
+  }
+
+  void updateBodyPoseMode(const double dt, const bool cmd_vel_timed_out)
+  {
+    left_phase_ = GaitPhase::DOWN;
+    right_phase_ = GaitPhase::DOWN;
+    cmd_vel_smoothed_ = zeroTwist();
+    heading_hold_active_ = false;
+
+    const KDL::Twist target = bodyPoseTargetFromCommand(cmd_vel_timed_out);
+    body_pose_current_ = limitBodyPoseRate(body_pose_current_, target, dt);
+
+    const double roll = body_pose_current_.rot.x();
+    const double pitch = body_pose_current_.rot.y();
+    const double yaw = body_pose_current_.rot.z();
+    const KDL::Vector translation = body_pose_current_.vel;
+
+    const KDL::Rotation body_rotation = KDL::Rotation::RPY(roll, pitch, yaw);
+    const KDL::Rotation base_from_world = body_rotation.Inverse();
+    for (Leg & leg : legs_) {
+      const KDL::Vector planted_foot_position =
+        leg.foot_center_position + KDL::Vector(0.0, 0.0, params_.foot_z_down);
+      const KDL::Vector foot_position_in_base =
+        base_from_world * (planted_foot_position - translation);
+      leg.foot_relative_position = foot_position_in_base - leg.foot_center_position;
+    }
+  }
+
   void standStill(const double dt)
   {
     left_phase_ = GaitPhase::DOWN;
@@ -424,7 +652,9 @@ private:
     const double duration_vertical)
   {
     if (left_phase_ == GaitPhase::DOWN && right_phase_ == GaitPhase::DOWN) {
-      right_phase_ = GaitPhase::RISING;
+      if (min_duration_to_rising <= dt) {
+        right_phase_ = GaitPhase::RISING;
+      }
     } else if (left_phase_ == GaitPhase::DOWN &&
       right_phase_ == GaitPhase::FALLING)
     {
@@ -502,33 +732,42 @@ private:
   {
     const rclcpp::Time now = this->now();
     const double dt = getDt();
-
     const double cmd_vel_oldness = (now - cmd_vel_stamp_).seconds();
     const bool cmd_vel_timed_out = cmd_vel_oldness > params_.cmd_vel_timeout;
-    if (cmd_vel_timed_out) {
-      RCLCPP_INFO_THROTTLE(
-        this->get_logger(), *this->get_clock(), 2000,
-        "Received cmd_vel timed out (%.2f > %.2f s), holding stance.",
-        cmd_vel_oldness, params_.cmd_vel_timeout);
-    }
 
-    const bool falling =
-      left_phase_ == GaitPhase::FALLING || right_phase_ == GaitPhase::FALLING;
-    if (!falling) {
-      cmd_vel_smoothed_ = cmd_vel_timed_out ? zeroTwist() : cmd_vel_;
-    }
-
-    std::vector<KDL::Vector> foot_velocities = computeFootVelocities();
-    const bool active_motion = footMotionActive(foot_velocities);
-
-    if (!active_motion) {
-      standStill(dt);
+    if (body_pose_mode_enabled_) {
+      updateBodyPoseMode(dt, cmd_vel_timed_out);
     } else {
-      const double duration_vertical =
-        (params_.foot_z_up - params_.foot_z_down) / params_.vertical_velocity;
-      const double min_duration_to_rising = getMinimumSupportDuration(foot_velocities);
-      updatePhases(dt, min_duration_to_rising, duration_vertical);
-      moveLegs(dt, foot_velocities);
+      if (cmd_vel_timed_out) {
+        RCLCPP_INFO_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "Received cmd_vel timed out (%.2f > %.2f s), holding stance.",
+          cmd_vel_oldness, params_.cmd_vel_timeout);
+      }
+
+      const bool falling =
+        left_phase_ == GaitPhase::FALLING || right_phase_ == GaitPhase::FALLING;
+      if (!falling) {
+        const KDL::Twist target_command =
+          cmd_vel_timed_out ? zeroTwist() : applyHeadingHold(cmd_vel_);
+        cmd_vel_smoothed_ = limitCommandRate(cmd_vel_smoothed_, target_command, dt);
+      }
+      if (cmd_vel_timed_out) {
+        heading_hold_active_ = false;
+      }
+
+      std::vector<KDL::Vector> foot_velocities = computeFootVelocities();
+      const bool active_motion = footMotionActive(foot_velocities);
+
+      if (!active_motion) {
+        standStill(dt);
+      } else {
+        const double duration_vertical =
+          (params_.foot_z_up - params_.foot_z_down) / params_.vertical_velocity;
+        const double min_duration_to_rising = getMinimumSupportDuration(foot_velocities);
+        updatePhases(dt, min_duration_to_rising, duration_vertical);
+        moveLegs(dt, foot_velocities);
+      }
     }
 
   // Get joint angles (inverse kinematics)
@@ -602,6 +841,10 @@ private:
     cmd_vel_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr
     cmd_vel_unstamped_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr
+    odom_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
+    body_pose_mode_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
     robot_description_sub_;
   rclcpp::Publisher<actuator_msgs::msg::Actuators>::SharedPtr
@@ -626,6 +869,13 @@ private:
   KDL::Twist cmd_vel_;
   KDL::Twist cmd_vel_smoothed_;
   rclcpp::Time cmd_vel_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  bool has_odom_ = false;
+  double current_yaw_ = 0.0;
+  double current_yaw_rate_ = 0.0;
+  bool heading_hold_active_ = false;
+  double heading_hold_yaw_ = 0.0;
+  bool body_pose_mode_enabled_ = false;
+  KDL::Twist body_pose_current_;
   // Phases of the two front feet
   // alternating feet are in phase
   GaitPhase left_phase_;

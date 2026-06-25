@@ -16,6 +16,7 @@
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>actuator_msgs</depend>
+  <depend>nav_msgs</depend>
   <depend>orocos_kdl_vendor</depend>
   <depend>antsy_kinematics</depend>
   <depend>antsy_msgs</depend>
