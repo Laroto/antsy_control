@@ -424,7 +424,9 @@ private:
     const double duration_vertical)
   {
     if (left_phase_ == GaitPhase::DOWN && right_phase_ == GaitPhase::DOWN) {
-      right_phase_ = GaitPhase::RISING;
+      if (min_duration_to_rising <= dt) {
+        right_phase_ = GaitPhase::RISING;
+      }
     } else if (left_phase_ == GaitPhase::DOWN &&
       right_phase_ == GaitPhase::FALLING)
     {
