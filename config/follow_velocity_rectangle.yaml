@@ -42,3 +42,13 @@
     command_filter:
       max_linear_acceleration: 0.8
       max_angular_acceleration: 2.0
+
+    body_pose:
+      max_x: 0.030
+      max_y: 0.025
+      max_z: 0.020
+      max_roll: 0.18
+      max_pitch: 0.18
+      max_yaw: 0.22
+      linear_rate: 0.10
+      angular_rate: 0.70

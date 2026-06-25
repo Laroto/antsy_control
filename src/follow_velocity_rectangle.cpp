@@ -48,6 +48,7 @@ public:
     loadParameters();
     cmd_vel_ = zeroTwist();
     cmd_vel_smoothed_ = zeroTwist();
+    body_pose_current_ = zeroTwist();
 
     // Listen to velocity setpoint
     cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(
@@ -177,6 +178,14 @@ private:
     double heading_hold_angular_deadband;
     double max_linear_acceleration;
     double max_angular_acceleration;
+    double body_pose_max_x;
+    double body_pose_max_y;
+    double body_pose_max_z;
+    double body_pose_max_roll;
+    double body_pose_max_pitch;
+    double body_pose_max_yaw;
+    double body_pose_linear_rate;
+    double body_pose_angular_rate;
     double velocity_epsilon;
     double max_dt;
   };
@@ -235,6 +244,22 @@ private:
       this->declare_parameter<double>("command_filter.max_linear_acceleration", 0.8);
     params_.max_angular_acceleration =
       this->declare_parameter<double>("command_filter.max_angular_acceleration", 2.0);
+    params_.body_pose_max_x =
+      this->declare_parameter<double>("body_pose.max_x", 0.030);
+    params_.body_pose_max_y =
+      this->declare_parameter<double>("body_pose.max_y", 0.025);
+    params_.body_pose_max_z =
+      this->declare_parameter<double>("body_pose.max_z", 0.020);
+    params_.body_pose_max_roll =
+      this->declare_parameter<double>("body_pose.max_roll", 0.18);
+    params_.body_pose_max_pitch =
+      this->declare_parameter<double>("body_pose.max_pitch", 0.18);
+    params_.body_pose_max_yaw =
+      this->declare_parameter<double>("body_pose.max_yaw", 0.22);
+    params_.body_pose_linear_rate =
+      this->declare_parameter<double>("body_pose.linear_rate", 0.10);
+    params_.body_pose_angular_rate =
+      this->declare_parameter<double>("body_pose.angular_rate", 0.70);
     params_.velocity_epsilon =
       this->declare_parameter<double>("gait.velocity_epsilon", 1e-5);
     params_.max_dt =
@@ -259,6 +284,14 @@ private:
       params_.heading_hold_angular_deadband < 0.0 ||
       params_.max_linear_acceleration <= 0.0 ||
       params_.max_angular_acceleration <= 0.0 ||
+      params_.body_pose_max_x < 0.0 ||
+      params_.body_pose_max_y < 0.0 ||
+      params_.body_pose_max_z < 0.0 ||
+      params_.body_pose_max_roll < 0.0 ||
+      params_.body_pose_max_pitch < 0.0 ||
+      params_.body_pose_max_yaw < 0.0 ||
+      params_.body_pose_linear_rate <= 0.0 ||
+      params_.body_pose_angular_rate <= 0.0 ||
       params_.foot_z_up <= params_.foot_z_down)
     {
       throw std::runtime_error("Invalid follow_velocity gait parameters.");
@@ -335,8 +368,8 @@ private:
     }
 
     body_pose_mode_enabled_ = msg.data;
-    body_pose_demo_time_ = 0.0;
     cmd_vel_smoothed_ = zeroTwist();
+    body_pose_current_ = zeroTwist();
     heading_hold_active_ = false;
     left_phase_ = GaitPhase::DOWN;
     right_phase_ = GaitPhase::DOWN;
@@ -489,34 +522,59 @@ private:
     return limited;
   }
 
-  double rampDemoMotion(const double time) const
+  double clampSymmetric(const double value, const double limit) const
   {
-    return std::clamp(time / body_pose_demo_ramp_duration_, 0.0, 1.0);
+    return std::clamp(value, -limit, limit);
   }
 
-  void updateBodyPoseDemo(const double dt)
+  KDL::Twist bodyPoseTargetFromCommand(const bool cmd_vel_timed_out) const
   {
-    body_pose_demo_time_ += dt;
+    if (cmd_vel_timed_out) {
+      return zeroTwist();
+    }
+
+    KDL::Twist target = zeroTwist();
+    target.vel.x(clampSymmetric(cmd_vel_.vel.x(), params_.body_pose_max_x));
+    target.vel.y(clampSymmetric(cmd_vel_.vel.y(), params_.body_pose_max_y));
+    target.vel.z(clampSymmetric(cmd_vel_.vel.z(), params_.body_pose_max_z));
+    target.rot.x(clampSymmetric(cmd_vel_.rot.x(), params_.body_pose_max_roll));
+    target.rot.y(clampSymmetric(cmd_vel_.rot.y(), params_.body_pose_max_pitch));
+    target.rot.z(clampSymmetric(cmd_vel_.rot.z(), params_.body_pose_max_yaw));
+    return target;
+  }
+
+  KDL::Twist limitBodyPoseRate(
+    const KDL::Twist & current,
+    const KDL::Twist & target,
+    const double dt) const
+  {
+    KDL::Twist limited = current;
+    const double linear_step = params_.body_pose_linear_rate * dt;
+    const double angular_step = params_.body_pose_angular_rate * dt;
+
+    limited.vel.x(moveTowards(current.vel.x(), target.vel.x(), linear_step));
+    limited.vel.y(moveTowards(current.vel.y(), target.vel.y(), linear_step));
+    limited.vel.z(moveTowards(current.vel.z(), target.vel.z(), linear_step));
+    limited.rot.x(moveTowards(current.rot.x(), target.rot.x(), angular_step));
+    limited.rot.y(moveTowards(current.rot.y(), target.rot.y(), angular_step));
+    limited.rot.z(moveTowards(current.rot.z(), target.rot.z(), angular_step));
+    return limited;
+  }
+
+  void updateBodyPoseMode(const double dt, const bool cmd_vel_timed_out)
+  {
     left_phase_ = GaitPhase::DOWN;
     right_phase_ = GaitPhase::DOWN;
     cmd_vel_smoothed_ = zeroTwist();
     heading_hold_active_ = false;
 
-    const double t = body_pose_demo_time_;
-    const double ramp = rampDemoMotion(t);
-    const double roll = ramp * body_pose_roll_amplitude_ *
-      std::sin(2.0 * M_PI * body_pose_roll_frequency_ * t);
-    const double pitch = ramp * body_pose_pitch_amplitude_ *
-      std::sin(2.0 * M_PI * body_pose_pitch_frequency_ * t + 0.7);
-    const double yaw = ramp * body_pose_yaw_amplitude_ *
-      std::sin(2.0 * M_PI * body_pose_yaw_frequency_ * t + 1.4);
-    const KDL::Vector translation(
-      ramp * body_pose_x_amplitude_ *
-        std::sin(2.0 * M_PI * body_pose_x_frequency_ * t + 0.3),
-      ramp * body_pose_y_amplitude_ *
-        std::sin(2.0 * M_PI * body_pose_y_frequency_ * t + 1.0),
-      ramp * body_pose_z_amplitude_ *
-        std::sin(2.0 * M_PI * body_pose_z_frequency_ * t + 1.8));
+    const KDL::Twist target = bodyPoseTargetFromCommand(cmd_vel_timed_out);
+    body_pose_current_ = limitBodyPoseRate(body_pose_current_, target, dt);
+
+    const double roll = body_pose_current_.rot.x();
+    const double pitch = body_pose_current_.rot.y();
+    const double yaw = body_pose_current_.rot.z();
+    const KDL::Vector translation = body_pose_current_.vel;
 
     const KDL::Rotation body_rotation = KDL::Rotation::RPY(roll, pitch, yaw);
     const KDL::Rotation base_from_world = body_rotation.Inverse();
@@ -674,12 +732,12 @@ private:
   {
     const rclcpp::Time now = this->now();
     const double dt = getDt();
+    const double cmd_vel_oldness = (now - cmd_vel_stamp_).seconds();
+    const bool cmd_vel_timed_out = cmd_vel_oldness > params_.cmd_vel_timeout;
 
     if (body_pose_mode_enabled_) {
-      updateBodyPoseDemo(dt);
+      updateBodyPoseMode(dt, cmd_vel_timed_out);
     } else {
-      const double cmd_vel_oldness = (now - cmd_vel_stamp_).seconds();
-      const bool cmd_vel_timed_out = cmd_vel_oldness > params_.cmd_vel_timeout;
       if (cmd_vel_timed_out) {
         RCLCPP_INFO_THROTTLE(
           this->get_logger(), *this->get_clock(), 2000,
@@ -817,7 +875,7 @@ private:
   bool heading_hold_active_ = false;
   double heading_hold_yaw_ = 0.0;
   bool body_pose_mode_enabled_ = true;
-  double body_pose_demo_time_ = 0.0;
+  KDL::Twist body_pose_current_;
   // Phases of the two front feet
   // alternating feet are in phase
   GaitPhase left_phase_;
@@ -827,19 +885,6 @@ private:
   // TODO support other values than 6
   static const int nb_legs_ = 6;
   static const int nb_joints_per_leg_ = 3;
-  static constexpr double body_pose_demo_ramp_duration_ = 1.5;
-  static constexpr double body_pose_roll_amplitude_ = 0.10;
-  static constexpr double body_pose_pitch_amplitude_ = 0.10;
-  static constexpr double body_pose_yaw_amplitude_ = 0.14;
-  static constexpr double body_pose_x_amplitude_ = 0.015;
-  static constexpr double body_pose_y_amplitude_ = 0.012;
-  static constexpr double body_pose_z_amplitude_ = 0.012;
-  static constexpr double body_pose_roll_frequency_ = 0.18;
-  static constexpr double body_pose_pitch_frequency_ = 0.15;
-  static constexpr double body_pose_yaw_frequency_ = 0.12;
-  static constexpr double body_pose_x_frequency_ = 0.10;
-  static constexpr double body_pose_y_frequency_ = 0.11;
-  static constexpr double body_pose_z_frequency_ = 0.16;
 };
 
 int main(int argc, char * argv[])
