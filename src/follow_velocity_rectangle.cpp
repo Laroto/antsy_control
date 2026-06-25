@@ -10,6 +10,7 @@
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "actuator_msgs/msg/actuators.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float64.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "kdl/frames.hpp"
@@ -55,6 +56,8 @@ public:
       "cmd_vel_unstamped", 10, std::bind(&FollowVelocity::cmdVelUnstampedCallback, this, _1));
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
       "odom", 10, std::bind(&FollowVelocity::odomCallback, this, _1));
+    body_pose_mode_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+      "body_pose_mode", 10, std::bind(&FollowVelocity::bodyPoseModeCallback, this, _1));
     // Publisher for joint angle references
     actuators_pub_ = this->create_publisher<actuator_msgs::msg::Actuators>(
       "actuators", 1);
@@ -325,6 +328,22 @@ private:
     has_odom_ = true;
   }
 
+  void bodyPoseModeCallback(const std_msgs::msg::Bool & msg)
+  {
+    if (body_pose_mode_enabled_ == msg.data) {
+      return;
+    }
+
+    body_pose_mode_enabled_ = msg.data;
+    body_pose_demo_time_ = 0.0;
+    cmd_vel_smoothed_ = zeroTwist();
+    heading_hold_active_ = false;
+    left_phase_ = GaitPhase::DOWN;
+    right_phase_ = GaitPhase::DOWN;
+    RCLCPP_INFO(
+      this->get_logger(), "Body pose mode %s.", body_pose_mode_enabled_ ? "enabled" : "disabled");
+  }
+
   KDL::Twist zeroTwist() const
   {
     return KDL::Twist(KDL::Vector(0.0, 0.0, 0.0), KDL::Vector(0.0, 0.0, 0.0));
@@ -468,6 +487,46 @@ private:
     limited.rot.y(moveTowards(current.rot.y(), target.rot.y(), angular_step));
     limited.rot.z(moveTowards(current.rot.z(), target.rot.z(), angular_step));
     return limited;
+  }
+
+  double rampDemoMotion(const double time) const
+  {
+    return std::clamp(time / body_pose_demo_ramp_duration_, 0.0, 1.0);
+  }
+
+  void updateBodyPoseDemo(const double dt)
+  {
+    body_pose_demo_time_ += dt;
+    left_phase_ = GaitPhase::DOWN;
+    right_phase_ = GaitPhase::DOWN;
+    cmd_vel_smoothed_ = zeroTwist();
+    heading_hold_active_ = false;
+
+    const double t = body_pose_demo_time_;
+    const double ramp = rampDemoMotion(t);
+    const double roll = ramp * body_pose_roll_amplitude_ *
+      std::sin(2.0 * M_PI * body_pose_roll_frequency_ * t);
+    const double pitch = ramp * body_pose_pitch_amplitude_ *
+      std::sin(2.0 * M_PI * body_pose_pitch_frequency_ * t + 0.7);
+    const double yaw = ramp * body_pose_yaw_amplitude_ *
+      std::sin(2.0 * M_PI * body_pose_yaw_frequency_ * t + 1.4);
+    const KDL::Vector translation(
+      ramp * body_pose_x_amplitude_ *
+        std::sin(2.0 * M_PI * body_pose_x_frequency_ * t + 0.3),
+      ramp * body_pose_y_amplitude_ *
+        std::sin(2.0 * M_PI * body_pose_y_frequency_ * t + 1.0),
+      ramp * body_pose_z_amplitude_ *
+        std::sin(2.0 * M_PI * body_pose_z_frequency_ * t + 1.8));
+
+    const KDL::Rotation body_rotation = KDL::Rotation::RPY(roll, pitch, yaw);
+    const KDL::Rotation base_from_world = body_rotation.Inverse();
+    for (Leg & leg : legs_) {
+      const KDL::Vector planted_foot_position =
+        leg.foot_center_position + KDL::Vector(0.0, 0.0, params_.foot_z_down);
+      const KDL::Vector foot_position_in_base =
+        base_from_world * (planted_foot_position - translation);
+      leg.foot_relative_position = foot_position_in_base - leg.foot_center_position;
+    }
   }
 
   void standStill(const double dt)
@@ -616,37 +675,41 @@ private:
     const rclcpp::Time now = this->now();
     const double dt = getDt();
 
-    const double cmd_vel_oldness = (now - cmd_vel_stamp_).seconds();
-    const bool cmd_vel_timed_out = cmd_vel_oldness > params_.cmd_vel_timeout;
-    if (cmd_vel_timed_out) {
-      RCLCPP_INFO_THROTTLE(
-        this->get_logger(), *this->get_clock(), 2000,
-        "Received cmd_vel timed out (%.2f > %.2f s), holding stance.",
-        cmd_vel_oldness, params_.cmd_vel_timeout);
-    }
-
-    const bool falling =
-      left_phase_ == GaitPhase::FALLING || right_phase_ == GaitPhase::FALLING;
-    if (!falling) {
-      const KDL::Twist target_command =
-        cmd_vel_timed_out ? zeroTwist() : applyHeadingHold(cmd_vel_);
-      cmd_vel_smoothed_ = limitCommandRate(cmd_vel_smoothed_, target_command, dt);
-    }
-    if (cmd_vel_timed_out) {
-      heading_hold_active_ = false;
-    }
-
-    std::vector<KDL::Vector> foot_velocities = computeFootVelocities();
-    const bool active_motion = footMotionActive(foot_velocities);
-
-    if (!active_motion) {
-      standStill(dt);
+    if (body_pose_mode_enabled_) {
+      updateBodyPoseDemo(dt);
     } else {
-      const double duration_vertical =
-        (params_.foot_z_up - params_.foot_z_down) / params_.vertical_velocity;
-      const double min_duration_to_rising = getMinimumSupportDuration(foot_velocities);
-      updatePhases(dt, min_duration_to_rising, duration_vertical);
-      moveLegs(dt, foot_velocities);
+      const double cmd_vel_oldness = (now - cmd_vel_stamp_).seconds();
+      const bool cmd_vel_timed_out = cmd_vel_oldness > params_.cmd_vel_timeout;
+      if (cmd_vel_timed_out) {
+        RCLCPP_INFO_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "Received cmd_vel timed out (%.2f > %.2f s), holding stance.",
+          cmd_vel_oldness, params_.cmd_vel_timeout);
+      }
+
+      const bool falling =
+        left_phase_ == GaitPhase::FALLING || right_phase_ == GaitPhase::FALLING;
+      if (!falling) {
+        const KDL::Twist target_command =
+          cmd_vel_timed_out ? zeroTwist() : applyHeadingHold(cmd_vel_);
+        cmd_vel_smoothed_ = limitCommandRate(cmd_vel_smoothed_, target_command, dt);
+      }
+      if (cmd_vel_timed_out) {
+        heading_hold_active_ = false;
+      }
+
+      std::vector<KDL::Vector> foot_velocities = computeFootVelocities();
+      const bool active_motion = footMotionActive(foot_velocities);
+
+      if (!active_motion) {
+        standStill(dt);
+      } else {
+        const double duration_vertical =
+          (params_.foot_z_up - params_.foot_z_down) / params_.vertical_velocity;
+        const double min_duration_to_rising = getMinimumSupportDuration(foot_velocities);
+        updatePhases(dt, min_duration_to_rising, duration_vertical);
+        moveLegs(dt, foot_velocities);
+      }
     }
 
   // Get joint angles (inverse kinematics)
@@ -722,6 +785,8 @@ private:
     cmd_vel_unstamped_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr
     odom_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
+    body_pose_mode_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
     robot_description_sub_;
   rclcpp::Publisher<actuator_msgs::msg::Actuators>::SharedPtr
@@ -751,6 +816,8 @@ private:
   double current_yaw_rate_ = 0.0;
   bool heading_hold_active_ = false;
   double heading_hold_yaw_ = 0.0;
+  bool body_pose_mode_enabled_ = true;
+  double body_pose_demo_time_ = 0.0;
   // Phases of the two front feet
   // alternating feet are in phase
   GaitPhase left_phase_;
@@ -760,6 +827,19 @@ private:
   // TODO support other values than 6
   static const int nb_legs_ = 6;
   static const int nb_joints_per_leg_ = 3;
+  static constexpr double body_pose_demo_ramp_duration_ = 1.5;
+  static constexpr double body_pose_roll_amplitude_ = 0.10;
+  static constexpr double body_pose_pitch_amplitude_ = 0.10;
+  static constexpr double body_pose_yaw_amplitude_ = 0.14;
+  static constexpr double body_pose_x_amplitude_ = 0.015;
+  static constexpr double body_pose_y_amplitude_ = 0.012;
+  static constexpr double body_pose_z_amplitude_ = 0.012;
+  static constexpr double body_pose_roll_frequency_ = 0.18;
+  static constexpr double body_pose_pitch_frequency_ = 0.15;
+  static constexpr double body_pose_yaw_frequency_ = 0.12;
+  static constexpr double body_pose_x_frequency_ = 0.10;
+  static constexpr double body_pose_y_frequency_ = 0.11;
+  static constexpr double body_pose_z_frequency_ = 0.16;
 };
 
 int main(int argc, char * argv[])
