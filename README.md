@@ -9,6 +9,7 @@ The controller also has a body-pose mode for showing roll, pitch, yaw, and small
 ```bash
 ros2 topic pub --once /body_pose_mode std_msgs/msg/Bool "{data: true}"
 ros2 topic pub --once /body_pose_mode std_msgs/msg/Bool "{data: false}"
+ros2 service call /go_to_rest_pose std_srvs/srv/Trigger "{}"
 ```
 
 In body-pose mode, `cmd_vel` becomes a bounded body pose command instead of a walking velocity: `linear.x/y/z` move the body in XYZ, and `angular.x/y/z` command roll, pitch, and yaw.

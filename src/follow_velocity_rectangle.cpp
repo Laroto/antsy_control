@@ -13,6 +13,7 @@
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/float64.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "std_srvs/srv/trigger.hpp"
 #include "kdl/frames.hpp"
 #include "kdl/jntarray.hpp"
 
@@ -30,11 +31,28 @@ enum class GaitPhase {
   FALLING   = 3,
 };
 
+enum class StopState {
+  WALKING         = 0,
+  LANDING         = 1,
+  REPLANT_LEFT    = 2,
+  REPLANT_RIGHT   = 3,
+  HOLDING         = 4,
+};
+
+enum class RestState {
+  LANDING         = 0,
+  REPLANT_LEFT    = 1,
+  REPLANT_RIGHT   = 2,
+  HOLDING         = 3,
+};
+
 struct Leg {
   // neutral position, expressed in robot base_link
   KDL::Vector foot_center_position;
   // last foot position, expressed relative to neutral position
   KDL::Vector foot_relative_position;
+  KDL::Vector swing_start_position;
+  bool in_continuous_swing = false;
   // last IK solution (to initialize the IK solver next time)
   KDL::JntArray joint_angles;
 };
@@ -59,6 +77,9 @@ public:
       "odom", 10, std::bind(&FollowVelocity::odomCallback, this, _1));
     body_pose_mode_sub_ = this->create_subscription<std_msgs::msg::Bool>(
       "body_pose_mode", 10, std::bind(&FollowVelocity::bodyPoseModeCallback, this, _1));
+    go_to_rest_pose_srv_ = this->create_service<std_srvs::srv::Trigger>(
+      "go_to_rest_pose",
+      std::bind(&FollowVelocity::goToRestPoseCallback, this, _1, _2));
     // Publisher for joint angle references
     actuators_pub_ = this->create_publisher<actuator_msgs::msg::Actuators>(
       "actuators", 1);
@@ -89,12 +110,17 @@ public:
       legs_[i].foot_relative_position.x(0);
       legs_[i].foot_relative_position.y(0);
       legs_[i].foot_relative_position.z(params_.foot_z_down);
+      legs_[i].swing_start_position = legs_[i].foot_relative_position;
       legs_[i].joint_angles = KDL::JntArray(nb_joints_per_leg_);
       const std::vector<double> & seed =
         i < nb_legs_ / 2 ? params_.ik_seed_joint_angles_left : params_.ik_seed_joint_angles_right;
       for (int j = 0; j < nb_joints_per_leg_; j++) {
         legs_[i].joint_angles(j) = seed[j];
       }
+    }
+    rest_pose_targets_.resize(nb_legs_);
+    for (int i = 0; i < nb_legs_; i++) {
+      rest_pose_targets_[i] = legs_[i].foot_relative_position;
     }
     left_phase_ = GaitPhase::DOWN;
     right_phase_ = GaitPhase::DOWN;
@@ -166,6 +192,12 @@ private:
     double vertical_velocity;
     double swing_xy_velocity;
     double idle_return_velocity;
+    double stop_recenter_tolerance;
+    double stop_recenter_velocity;
+    bool ready_stance_enabled;
+    double ready_stance_linear_x;
+    double ready_stance_linear_y;
+    double ready_stance_angular_z;
     double ik_position_weight;
     double ik_orientation_weight;
     std::vector<double> ik_seed_joint_angles_left;
@@ -218,6 +250,18 @@ private:
       this->declare_parameter<double>("gait.swing_xy_velocity", 0.55);
     params_.idle_return_velocity =
       this->declare_parameter<double>("gait.idle_return_velocity", 0.25);
+    params_.stop_recenter_tolerance =
+      this->declare_parameter<double>("gait.stop_recenter_tolerance", 0.020);
+    params_.stop_recenter_velocity =
+      this->declare_parameter<double>("gait.stop_recenter_velocity", 0.20);
+    params_.ready_stance_enabled =
+      this->declare_parameter<bool>("gait.ready_stance_enabled", true);
+    params_.ready_stance_linear_x =
+      this->declare_parameter<double>("gait.ready_stance_linear_x", 1.0);
+    params_.ready_stance_linear_y =
+      this->declare_parameter<double>("gait.ready_stance_linear_y", 0.0);
+    params_.ready_stance_angular_z =
+      this->declare_parameter<double>("gait.ready_stance_angular_z", 0.0);
     params_.ik_position_weight =
       this->declare_parameter<double>("ik.position_weight", 1.0);
     params_.ik_orientation_weight =
@@ -273,6 +317,11 @@ private:
       params_.vertical_velocity <= 0.0 ||
       params_.swing_xy_velocity <= 0.0 ||
       params_.idle_return_velocity <= 0.0 ||
+      params_.stop_recenter_tolerance < 0.0 ||
+      params_.stop_recenter_velocity <= 0.0 ||
+      !std::isfinite(params_.ready_stance_linear_x) ||
+      !std::isfinite(params_.ready_stance_linear_y) ||
+      !std::isfinite(params_.ready_stance_angular_z) ||
       params_.ik_position_weight <= 0.0 ||
       params_.ik_orientation_weight < 0.0 ||
       params_.ik_seed_joint_angles_left.size() != nb_joints_per_leg_ ||
@@ -368,11 +417,14 @@ private:
     }
 
     body_pose_mode_enabled_ = msg.data;
+    rest_sequence_active_ = false;
     cmd_vel_smoothed_ = zeroTwist();
     body_pose_current_ = zeroTwist();
     heading_hold_active_ = false;
+    clearContinuousSwingState();
     left_phase_ = GaitPhase::DOWN;
     right_phase_ = GaitPhase::DOWN;
+    stop_state_ = StopState::HOLDING;
     RCLCPP_INFO(
       this->get_logger(), "Body pose mode %s.", body_pose_mode_enabled_ ? "enabled" : "disabled");
   }
@@ -423,6 +475,23 @@ private:
     return std::max(0.0, duration);
   }
 
+  void goToRestPoseCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+  {
+    body_pose_mode_enabled_ = false;
+    rest_sequence_active_ = true;
+    rest_state_ = allLegsDown() ? chooseRestState() : RestState::LANDING;
+    cmd_vel_ = zeroTwist();
+    cmd_vel_smoothed_ = zeroTwist();
+    body_pose_current_ = zeroTwist();
+    cmd_vel_stamp_ = this->now();
+    heading_hold_active_ = false;
+    clearContinuousSwingState();
+    response->success = true;
+    response->message = "Returning to startup resting pose.";
+  }
+
   KDL::Vector getRectangleBoundaryGoal(const KDL::Vector & direction) const
   {
     double scale = std::numeric_limits<double>::infinity();
@@ -468,6 +537,201 @@ private:
       }
     }
     return false;
+  }
+
+  bool commandActive(const KDL::Twist & command) const
+  {
+    return std::hypot(command.vel.x(), command.vel.y()) >= params_.velocity_epsilon ||
+      std::abs(command.rot.z()) >= params_.velocity_epsilon;
+  }
+
+  bool isTripodPhaseRepresentative(const bool left_tripod, const int leg_index) const
+  {
+    return left_tripod ? leg_index % 2 == 0 : leg_index % 2 == 1;
+  }
+
+  double tripodMaxOffset(const bool left_tripod) const
+  {
+    double max_offset = 0.0;
+    for (int i = 0; i < nb_legs_; i++) {
+      if (!isTripodPhaseRepresentative(left_tripod, i)) {
+        continue;
+      }
+      const KDL::Vector & p = legs_[i].foot_relative_position;
+      max_offset = std::max(max_offset, std::hypot(p.x(), p.y()));
+    }
+    return max_offset;
+  }
+
+  bool tripodNeedsRecentering(const bool left_tripod) const
+  {
+    return tripodMaxOffset(left_tripod) > params_.stop_recenter_tolerance;
+  }
+
+  bool allLegsDown() const
+  {
+    return left_phase_ == GaitPhase::DOWN && right_phase_ == GaitPhase::DOWN;
+  }
+
+  double wrappedPhase(double phase) const
+  {
+    phase = std::fmod(phase, 1.0);
+    if (phase < 0.0) {
+      phase += 1.0;
+    }
+    return phase;
+  }
+
+  double tripodPhase(const bool left_tripod) const
+  {
+    return wrappedPhase(gait_cycle_phase_ + (left_tripod ? 0.0 : 0.5));
+  }
+
+  GaitPhase phaseLabelFromTripodPhase(const double phase) const
+  {
+    if (phase >= swing_phase_fraction_) {
+      return GaitPhase::DOWN;
+    }
+
+    const double swing_progress = phase / swing_phase_fraction_;
+    return swing_progress < 0.5 ? GaitPhase::RISING : GaitPhase::FALLING;
+  }
+
+  void updatePhaseLabelsFromCycle()
+  {
+    left_phase_ = phaseLabelFromTripodPhase(tripodPhase(true));
+    right_phase_ = phaseLabelFromTripodPhase(tripodPhase(false));
+  }
+
+  StopState chooseReplantState() const
+  {
+    const bool left_needs_recenter = tripodNeedsRecentering(true);
+    const bool right_needs_recenter = tripodNeedsRecentering(false);
+    if (!left_needs_recenter && !right_needs_recenter) {
+      return StopState::HOLDING;
+    }
+    if (left_needs_recenter && !right_needs_recenter) {
+      return StopState::REPLANT_LEFT;
+    }
+    if (!left_needs_recenter && right_needs_recenter) {
+      return StopState::REPLANT_RIGHT;
+    }
+    return tripodMaxOffset(true) >= tripodMaxOffset(false) ?
+      StopState::REPLANT_LEFT : StopState::REPLANT_RIGHT;
+  }
+
+  double tripodRestMaxError(const bool left_tripod) const
+  {
+    double max_error = 0.0;
+    for (int i = 0; i < nb_legs_; i++) {
+      if (!isTripodPhaseRepresentative(left_tripod, i)) {
+        continue;
+      }
+      const KDL::Vector & p = legs_[i].foot_relative_position;
+      const KDL::Vector & target = rest_pose_targets_[i];
+      max_error = std::max(
+        max_error,
+        std::hypot(target.x() - p.x(), target.y() - p.y()));
+    }
+    return max_error;
+  }
+
+  bool tripodNeedsRestTarget(const bool left_tripod) const
+  {
+    return tripodRestMaxError(left_tripod) > params_.stop_recenter_tolerance;
+  }
+
+  bool allLegsAtRestPose() const
+  {
+    for (int i = 0; i < nb_legs_; i++) {
+      const KDL::Vector & p = legs_[i].foot_relative_position;
+      const KDL::Vector & target = rest_pose_targets_[i];
+      if (std::hypot(target.x() - p.x(), target.y() - p.y()) > params_.stop_recenter_tolerance ||
+        std::abs(target.z() - p.z()) > params_.velocity_epsilon)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  RestState chooseRestState() const
+  {
+    const bool left_needs_rest = tripodNeedsRestTarget(true);
+    const bool right_needs_rest = tripodNeedsRestTarget(false);
+    if (!left_needs_rest && !right_needs_rest) {
+      return RestState::HOLDING;
+    }
+    if (left_needs_rest && !right_needs_rest) {
+      return RestState::REPLANT_LEFT;
+    }
+    if (!left_needs_rest && right_needs_rest) {
+      return RestState::REPLANT_RIGHT;
+    }
+    return tripodRestMaxError(true) >= tripodRestMaxError(false) ?
+      RestState::REPLANT_LEFT : RestState::REPLANT_RIGHT;
+  }
+
+  KDL::Vector footVelocityForCommand(const int leg_index, const KDL::Twist & command) const
+  {
+    const KDL::Vector r =
+      legs_[leg_index].foot_center_position + legs_[leg_index].foot_relative_position;
+    return -KDL::Vector(
+      command.vel.x() - command.rot.z() * r.y(),
+      command.vel.y() + command.rot.z() * r.x(),
+      0.0);
+  }
+
+  std::vector<KDL::Vector> computeFootVelocitiesForCommand(const KDL::Twist & command) const
+  {
+    std::vector<KDL::Vector> foot_velocities(nb_legs_);
+    for (int i = 0; i < nb_legs_; i++) {
+      foot_velocities[i] = footVelocityForCommand(i, command);
+    }
+    return foot_velocities;
+  }
+
+  double readyStanceError(
+    const std::vector<KDL::Vector> & foot_velocities,
+    const bool start_with_right) const
+  {
+    const bool swing_left_tripod = !start_with_right;
+    double error = 0.0;
+    for (int i = 0; i < nb_legs_; i++) {
+      const KDL::Vector boundary = getRectangleBoundaryGoal(foot_velocities[i]);
+      const bool swing_leg = isTripodPhaseRepresentative(swing_left_tripod, i);
+      const KDL::Vector target = swing_leg ? boundary : -boundary;
+      const KDL::Vector & p = legs_[i].foot_relative_position;
+      error += std::hypot(target.x() - p.x(), target.y() - p.y());
+    }
+    return error;
+  }
+
+  bool chooseStartWithRightTripod(const KDL::Twist & command) const
+  {
+    const std::vector<KDL::Vector> foot_velocities = computeFootVelocitiesForCommand(command);
+    const double right_start_error = readyStanceError(foot_velocities, true);
+    const double left_start_error = readyStanceError(foot_velocities, false);
+    if (std::abs(right_start_error - left_start_error) <= params_.velocity_epsilon) {
+      return start_with_right_tripod_;
+    }
+    return right_start_error < left_start_error;
+  }
+
+  void setReadyStanceForCommand(const KDL::Twist & command, const bool start_with_right)
+  {
+    const std::vector<KDL::Vector> foot_velocities = computeFootVelocitiesForCommand(command);
+    const bool swing_left_tripod = !start_with_right;
+    for (int i = 0; i < nb_legs_; i++) {
+      const KDL::Vector boundary = getRectangleBoundaryGoal(foot_velocities[i]);
+      const bool swing_leg = isTripodPhaseRepresentative(swing_left_tripod, i);
+      KDL::Vector & p = legs_[i].foot_relative_position;
+      p.x(swing_leg ? boundary.x() : -boundary.x());
+      p.y(swing_leg ? boundary.y() : -boundary.y());
+      p.z(params_.foot_z_down);
+      legs_[i].swing_start_position = p;
+      legs_[i].in_continuous_swing = false;
+    }
   }
 
   bool translationCommandActive(const KDL::Twist & command) const
@@ -565,8 +829,10 @@ private:
   {
     left_phase_ = GaitPhase::DOWN;
     right_phase_ = GaitPhase::DOWN;
+    stop_state_ = StopState::HOLDING;
     cmd_vel_smoothed_ = zeroTwist();
     heading_hold_active_ = false;
+    clearContinuousSwingState();
 
     const KDL::Twist target = bodyPoseTargetFromCommand(cmd_vel_timed_out);
     body_pose_current_ = limitBodyPoseRate(body_pose_current_, target, dt);
@@ -587,16 +853,298 @@ private:
     }
   }
 
-  void standStill(const double dt)
+  void holdCurrentPose()
   {
     left_phase_ = GaitPhase::DOWN;
     right_phase_ = GaitPhase::DOWN;
+    clearContinuousSwingState();
     for (Leg & leg : legs_) {
       KDL::Vector & p = leg.foot_relative_position;
-      const double xy_step = params_.idle_return_velocity * dt;
-      p.x(moveTowards(p.x(), 0.0, xy_step));
-      p.y(moveTowards(p.y(), 0.0, xy_step));
-      p.z(moveTowards(p.z(), params_.foot_z_down, params_.vertical_velocity * dt));
+      p.z(params_.foot_z_down);
+    }
+  }
+
+  void moveFootHorizontalToTarget(
+    KDL::Vector & p,
+    const double goal_x,
+    const double goal_y,
+    const double max_speed,
+    const double dt) const
+  {
+    const double dx = goal_x - p.x();
+    const double dy = goal_y - p.y();
+    const double distance = std::hypot(dx, dy);
+    const double max_step = max_speed * dt;
+
+    if (distance <= max_step || distance < params_.velocity_epsilon) {
+      p.x(goal_x);
+      p.y(goal_y);
+      return;
+    }
+
+    const double ratio = max_step / distance;
+    p.x(p.x() + dx * ratio);
+    p.y(p.y() + dy * ratio);
+  }
+
+  void landSwingFeetInPlace(const double dt)
+  {
+    for (int i = 0; i < nb_legs_; i++) {
+      KDL::Vector & p = legs_[i].foot_relative_position;
+      if (getLegPhase(i) == GaitPhase::DOWN) {
+        legs_[i].in_continuous_swing = false;
+        p.z(params_.foot_z_down);
+        continue;
+      }
+      legs_[i].in_continuous_swing = false;
+      p.z(std::max(params_.foot_z_down, p.z() - params_.vertical_velocity * dt));
+    }
+
+    if (left_phase_ != GaitPhase::DOWN &&
+      legs_[0].foot_relative_position.z() <= params_.foot_z_down + params_.velocity_epsilon)
+    {
+      left_phase_ = GaitPhase::DOWN;
+    }
+    if (right_phase_ != GaitPhase::DOWN &&
+      legs_[1].foot_relative_position.z() <= params_.foot_z_down + params_.velocity_epsilon)
+    {
+      right_phase_ = GaitPhase::DOWN;
+    }
+  }
+
+  void replantTripod(const bool left_tripod, const double dt)
+  {
+    GaitPhase & active_phase = left_tripod ? left_phase_ : right_phase_;
+    const int sample_leg_index = left_tripod ? 0 : 1;
+
+    if (active_phase == GaitPhase::DOWN && tripodNeedsRecentering(left_tripod)) {
+      active_phase = GaitPhase::RISING;
+    }
+
+    if (active_phase == GaitPhase::RISING &&
+      legs_[sample_leg_index].foot_relative_position.z() + dt * params_.vertical_velocity >=
+      params_.foot_z_up)
+    {
+      active_phase = GaitPhase::UP;
+    }
+
+    if (active_phase == GaitPhase::UP && !tripodNeedsRecentering(left_tripod)) {
+      active_phase = GaitPhase::FALLING;
+    }
+
+    for (int i = 0; i < nb_legs_; i++) {
+      KDL::Vector & p = legs_[i].foot_relative_position;
+      if (!isTripodPhaseRepresentative(left_tripod, i)) {
+        p.z(params_.foot_z_down);
+        continue;
+      }
+
+      switch (active_phase) {
+        case GaitPhase::DOWN:
+          p.z(params_.foot_z_down);
+          break;
+        case GaitPhase::RISING:
+          p.z(std::min(params_.foot_z_up, p.z() + params_.vertical_velocity * dt));
+          moveFootHorizontalToTarget(p, 0.0, 0.0, params_.stop_recenter_velocity, dt);
+          break;
+        case GaitPhase::UP:
+          p.z(params_.foot_z_up);
+          moveFootHorizontalToTarget(p, 0.0, 0.0, params_.stop_recenter_velocity, dt);
+          break;
+        case GaitPhase::FALLING:
+          p.z(std::max(params_.foot_z_down, p.z() - params_.vertical_velocity * dt));
+          moveFootHorizontalToTarget(p, 0.0, 0.0, params_.stop_recenter_velocity, dt);
+          break;
+      }
+    }
+
+    if (active_phase == GaitPhase::UP && !tripodNeedsRecentering(left_tripod)) {
+      active_phase = GaitPhase::FALLING;
+    }
+
+    if (active_phase == GaitPhase::FALLING &&
+      legs_[sample_leg_index].foot_relative_position.z() <= params_.foot_z_down + params_.velocity_epsilon)
+    {
+      active_phase = GaitPhase::DOWN;
+      for (int i = 0; i < nb_legs_; i++) {
+        if (!isTripodPhaseRepresentative(left_tripod, i)) {
+          continue;
+        }
+        legs_[i].foot_relative_position.z(params_.foot_z_down);
+      }
+    }
+  }
+
+  void replantTripodToRestTargets(const bool left_tripod, const double dt)
+  {
+    GaitPhase & active_phase = left_tripod ? left_phase_ : right_phase_;
+    const int sample_leg_index = left_tripod ? 0 : 1;
+
+    if (active_phase == GaitPhase::DOWN && tripodNeedsRestTarget(left_tripod)) {
+      active_phase = GaitPhase::RISING;
+    }
+
+    if (active_phase == GaitPhase::RISING &&
+      legs_[sample_leg_index].foot_relative_position.z() + dt * params_.vertical_velocity >=
+      params_.foot_z_up)
+    {
+      active_phase = GaitPhase::UP;
+    }
+
+    if (active_phase == GaitPhase::UP && !tripodNeedsRestTarget(left_tripod)) {
+      active_phase = GaitPhase::FALLING;
+    }
+
+    for (int i = 0; i < nb_legs_; i++) {
+      KDL::Vector & p = legs_[i].foot_relative_position;
+      if (!isTripodPhaseRepresentative(left_tripod, i)) {
+        p.z(params_.foot_z_down);
+        continue;
+      }
+
+      const KDL::Vector & target = rest_pose_targets_[i];
+      switch (active_phase) {
+        case GaitPhase::DOWN:
+          p = target;
+          break;
+        case GaitPhase::RISING:
+          p.z(std::min(params_.foot_z_up, p.z() + params_.vertical_velocity * dt));
+          moveFootHorizontalToTarget(
+            p, target.x(), target.y(), params_.stop_recenter_velocity, dt);
+          break;
+        case GaitPhase::UP:
+          p.z(params_.foot_z_up);
+          moveFootHorizontalToTarget(
+            p, target.x(), target.y(), params_.stop_recenter_velocity, dt);
+          break;
+        case GaitPhase::FALLING:
+          p.z(std::max(params_.foot_z_down, p.z() - params_.vertical_velocity * dt));
+          moveFootHorizontalToTarget(
+            p, target.x(), target.y(), params_.stop_recenter_velocity, dt);
+          break;
+      }
+    }
+
+    if (active_phase == GaitPhase::UP && !tripodNeedsRestTarget(left_tripod)) {
+      active_phase = GaitPhase::FALLING;
+    }
+
+    if (active_phase == GaitPhase::FALLING &&
+      legs_[sample_leg_index].foot_relative_position.z() <= params_.foot_z_down + params_.velocity_epsilon)
+    {
+      active_phase = GaitPhase::DOWN;
+      for (int i = 0; i < nb_legs_; i++) {
+        if (!isTripodPhaseRepresentative(left_tripod, i)) {
+          continue;
+        }
+        legs_[i].foot_relative_position = rest_pose_targets_[i];
+      }
+    }
+  }
+
+  void beginStopSequence()
+  {
+    cmd_vel_smoothed_ = zeroTwist();
+    heading_hold_active_ = false;
+    clearContinuousSwingState();
+    stop_state_ = allLegsDown() ? StopState::HOLDING : StopState::LANDING;
+  }
+
+  void beginWalkingSequence(const KDL::Twist & command)
+  {
+    rest_sequence_active_ = false;
+    if (stop_state_ != StopState::WALKING && allLegsDown()) {
+      const bool start_with_right = chooseStartWithRightTripod(command);
+      if (params_.ready_stance_enabled && allLegsAtRestPose()) {
+        setReadyStanceForCommand(command, start_with_right);
+      }
+      gait_cycle_phase_ = start_with_right ? 0.5 : 0.0;
+      start_with_right_tripod_ = !start_with_right;
+      updatePhaseLabelsFromCycle();
+    }
+    stop_state_ = StopState::WALKING;
+  }
+
+  void holdRestPose()
+  {
+    left_phase_ = GaitPhase::DOWN;
+    right_phase_ = GaitPhase::DOWN;
+    clearContinuousSwingState();
+    for (int i = 0; i < nb_legs_; i++) {
+      legs_[i].foot_relative_position = rest_pose_targets_[i];
+    }
+  }
+
+  void updateRestSequence(const double dt)
+  {
+    cmd_vel_smoothed_ = zeroTwist();
+    body_pose_current_ = zeroTwist();
+    heading_hold_active_ = false;
+
+    switch (rest_state_) {
+      case RestState::LANDING:
+        landSwingFeetInPlace(dt);
+        if (allLegsDown()) {
+          rest_state_ = chooseRestState();
+        }
+        break;
+      case RestState::REPLANT_LEFT:
+        replantTripodToRestTargets(true, dt);
+        if (left_phase_ == GaitPhase::DOWN && !tripodNeedsRestTarget(true)) {
+          rest_state_ = tripodNeedsRestTarget(false) ? RestState::REPLANT_RIGHT : RestState::HOLDING;
+        }
+        break;
+      case RestState::REPLANT_RIGHT:
+        replantTripodToRestTargets(false, dt);
+        if (right_phase_ == GaitPhase::DOWN && !tripodNeedsRestTarget(false)) {
+          rest_state_ = tripodNeedsRestTarget(true) ? RestState::REPLANT_LEFT : RestState::HOLDING;
+        }
+        break;
+      case RestState::HOLDING:
+        holdRestPose();
+        rest_sequence_active_ = false;
+        stop_state_ = StopState::HOLDING;
+        break;
+    }
+
+    if (allLegsAtRestPose()) {
+      holdRestPose();
+      rest_sequence_active_ = false;
+      rest_state_ = RestState::HOLDING;
+      stop_state_ = StopState::HOLDING;
+    }
+  }
+
+  void updateStopSequence(const double dt)
+  {
+    cmd_vel_smoothed_ = zeroTwist();
+    heading_hold_active_ = false;
+
+    switch (stop_state_) {
+      case StopState::WALKING:
+        beginStopSequence();
+        break;
+      case StopState::LANDING:
+        landSwingFeetInPlace(dt);
+        if (allLegsDown()) {
+          stop_state_ = StopState::HOLDING;
+        }
+        break;
+      case StopState::REPLANT_LEFT:
+        replantTripod(true, dt);
+        if (left_phase_ == GaitPhase::DOWN && !tripodNeedsRecentering(true)) {
+          stop_state_ = tripodNeedsRecentering(false) ? StopState::REPLANT_RIGHT : StopState::HOLDING;
+        }
+        break;
+      case StopState::REPLANT_RIGHT:
+        replantTripod(false, dt);
+        if (right_phase_ == GaitPhase::DOWN && !tripodNeedsRecentering(false)) {
+          stop_state_ = tripodNeedsRecentering(true) ? StopState::REPLANT_LEFT : StopState::HOLDING;
+        }
+        break;
+      case StopState::HOLDING:
+        holdCurrentPose();
+        break;
     }
   }
 
@@ -626,6 +1174,82 @@ private:
       }
     }
     return foot_velocities;
+  }
+
+  double computeGaitPhaseRate(const std::vector<KDL::Vector> & foot_velocities) const
+  {
+    double phase_rate = 0.0;
+    for (const KDL::Vector & foot_velocity : foot_velocities) {
+      if (std::abs(foot_velocity.x()) >= params_.velocity_epsilon) {
+        phase_rate =
+          std::max(phase_rate, std::abs(foot_velocity.x()) / (4.0 * params_.step_limit_x));
+      }
+      if (std::abs(foot_velocity.y()) >= params_.velocity_epsilon) {
+        phase_rate =
+          std::max(phase_rate, std::abs(foot_velocity.y()) / (4.0 * params_.step_limit_y));
+      }
+    }
+    return phase_rate;
+  }
+
+  double smoothSwingHeight(const double swing_progress) const
+  {
+    return 0.5 * (1.0 - std::cos(2.0 * M_PI * std::clamp(swing_progress, 0.0, 1.0)));
+  }
+
+  double smoothSwingTravel(const double swing_progress) const
+  {
+    return std::clamp(swing_progress, 0.0, 1.0);
+  }
+
+  void clearContinuousSwingState()
+  {
+    for (Leg & leg : legs_) {
+      leg.in_continuous_swing = false;
+      leg.swing_start_position = leg.foot_relative_position;
+    }
+  }
+
+  void moveLegsContinuous(
+    const double dt,
+    const std::vector<KDL::Vector> & foot_velocities)
+  {
+    for (int i = 0; i < nb_legs_; i++) {
+      const bool left_tripod = i % 2 == 0;
+      const double phase = tripodPhase(left_tripod);
+      KDL::Vector & p = legs_[i].foot_relative_position;
+
+      if (phase < swing_phase_fraction_) {
+        const double swing_progress = phase / swing_phase_fraction_;
+        const double lift = smoothSwingHeight(swing_progress);
+        const double travel = smoothSwingTravel(swing_progress);
+        if (!legs_[i].in_continuous_swing) {
+          legs_[i].in_continuous_swing = true;
+          legs_[i].swing_start_position = p;
+        }
+        const KDL::Vector goal = -getRectangleBoundaryGoal(foot_velocities[i]);
+        p.x(legs_[i].swing_start_position.x() +
+          (goal.x() - legs_[i].swing_start_position.x()) * travel);
+        p.y(legs_[i].swing_start_position.y() +
+          (goal.y() - legs_[i].swing_start_position.y()) * travel);
+        p.z(params_.foot_z_down + (params_.foot_z_up - params_.foot_z_down) * lift);
+        clampFootXY(p);
+      } else {
+        legs_[i].in_continuous_swing = false;
+        p.z(params_.foot_z_down);
+        p += foot_velocities[i] * dt;
+        clampFootXY(p);
+      }
+    }
+  }
+
+  void updateContinuousGait(
+    const double dt,
+    const std::vector<KDL::Vector> & foot_velocities)
+  {
+    gait_cycle_phase_ = wrappedPhase(gait_cycle_phase_ + computeGaitPhaseRate(foot_velocities) * dt);
+    updatePhaseLabelsFromCycle();
+    moveLegsContinuous(dt, foot_velocities);
   }
 
   double getMinimumSupportDuration(const std::vector<KDL::Vector> & foot_velocities)
@@ -735,9 +1359,16 @@ private:
     const double cmd_vel_oldness = (now - cmd_vel_stamp_).seconds();
     const bool cmd_vel_timed_out = cmd_vel_oldness > params_.cmd_vel_timeout;
 
-    if (body_pose_mode_enabled_) {
+    const KDL::Twist raw_target_command = cmd_vel_timed_out ? zeroTwist() : cmd_vel_;
+    const bool interrupt_rest = commandActive(raw_target_command);
+
+    if (rest_sequence_active_ && !interrupt_rest) {
+      updateRestSequence(dt);
+    } else if (body_pose_mode_enabled_) {
+      rest_sequence_active_ = false;
       updateBodyPoseMode(dt, cmd_vel_timed_out);
     } else {
+      rest_sequence_active_ = false;
       if (cmd_vel_timed_out) {
         RCLCPP_INFO_THROTTLE(
           this->get_logger(), *this->get_clock(), 2000,
@@ -745,28 +1376,32 @@ private:
           cmd_vel_oldness, params_.cmd_vel_timeout);
       }
 
-      const bool falling =
-        left_phase_ == GaitPhase::FALLING || right_phase_ == GaitPhase::FALLING;
-      if (!falling) {
-        const KDL::Twist target_command =
-          cmd_vel_timed_out ? zeroTwist() : applyHeadingHold(cmd_vel_);
-        cmd_vel_smoothed_ = limitCommandRate(cmd_vel_smoothed_, target_command, dt);
-      }
-      if (cmd_vel_timed_out) {
-        heading_hold_active_ = false;
-      }
+      const KDL::Twist target_command =
+        cmd_vel_timed_out ? zeroTwist() : applyHeadingHold(cmd_vel_);
+      const bool motion_command_active = commandActive(target_command);
 
-      std::vector<KDL::Vector> foot_velocities = computeFootVelocities();
-      const bool active_motion = footMotionActive(foot_velocities);
-
-      if (!active_motion) {
-        standStill(dt);
+      if (!motion_command_active) {
+        if (stop_state_ == StopState::WALKING) {
+          beginStopSequence();
+        }
+        updateStopSequence(dt);
       } else {
-        const double duration_vertical =
-          (params_.foot_z_up - params_.foot_z_down) / params_.vertical_velocity;
-        const double min_duration_to_rising = getMinimumSupportDuration(foot_velocities);
-        updatePhases(dt, min_duration_to_rising, duration_vertical);
-        moveLegs(dt, foot_velocities);
+        if (stop_state_ != StopState::WALKING && allLegsDown()) {
+          beginWalkingSequence(target_command);
+        } else {
+          stop_state_ = StopState::WALKING;
+        }
+
+        cmd_vel_smoothed_ = limitCommandRate(cmd_vel_smoothed_, target_command, dt);
+
+        std::vector<KDL::Vector> foot_velocities = computeFootVelocities();
+        const bool active_motion = footMotionActive(foot_velocities);
+
+        if (!active_motion) {
+          holdCurrentPose();
+        } else {
+          updateContinuousGait(dt, foot_velocities);
+        }
       }
     }
 
@@ -845,6 +1480,8 @@ private:
     odom_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr
     body_pose_mode_sub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr
+    go_to_rest_pose_srv_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
     robot_description_sub_;
   rclcpp::Publisher<actuator_msgs::msg::Actuators>::SharedPtr
@@ -876,6 +1513,12 @@ private:
   double heading_hold_yaw_ = 0.0;
   bool body_pose_mode_enabled_ = false;
   KDL::Twist body_pose_current_;
+  StopState stop_state_ = StopState::HOLDING;
+  bool rest_sequence_active_ = false;
+  RestState rest_state_ = RestState::HOLDING;
+  std::vector<KDL::Vector> rest_pose_targets_;
+  double gait_cycle_phase_ = 0.0;
+  bool start_with_right_tripod_ = true;
   // Phases of the two front feet
   // alternating feet are in phase
   GaitPhase left_phase_;
@@ -885,6 +1528,7 @@ private:
   // TODO support other values than 6
   static const int nb_legs_ = 6;
   static const int nb_joints_per_leg_ = 3;
+  static constexpr double swing_phase_fraction_ = 0.5;
 };
 
 int main(int argc, char * argv[])
