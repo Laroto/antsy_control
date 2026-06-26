@@ -6,6 +6,22 @@
       period: 0.02
       max_dt: 0.05
 
+    leg_odometry:
+      enabled: true
+      topic: leg_odom
+      frame_id: odom
+      child_frame_id: base_link
+      use_joint_states: true
+      joint_states_topic: joint_states
+      min_support_legs: 3
+      max_fit_residual: 0.03
+      max_linear_delta: 0.03
+      max_angular_delta: 0.25
+      translation_scale: 1.0
+      propagate_on_invalid_update: false
+      max_prediction_time: 0.08
+      reset_pose_on_control_reset: true
+
     gait:
       # Tripod gait foot travel relative to each neutral foot position.
       step_limit_x: 0.045
@@ -33,6 +49,9 @@
 
     heading_hold:
       enabled: true
+      # Heading hold uses the controller's own leg odometry by default.
+      # Do not point this at simulator /odom unless you explicitly want that behavior.
+      odom_topic: "leg_odom"
       kp: 1.8
       kd: 0.30
       max_angular_velocity: 0.40
