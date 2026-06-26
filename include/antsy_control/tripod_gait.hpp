@@ -26,6 +26,7 @@ struct Leg
   KDL::Vector foot_center_position;
   KDL::Vector foot_relative_position;
   KDL::Vector swing_start_position;
+  KDL::Vector swing_goal_position;
   bool in_continuous_swing = false;
   KDL::JntArray joint_angles;
 };
@@ -134,6 +135,7 @@ private:
   double readyStanceError(
     const std::vector<KDL::Vector> & foot_velocities, bool start_with_right) const;
   bool chooseStartWithRightTripod(const KDL::Twist & command) const;
+  bool readyStanceApplies(const KDL::Twist & command) const;
   void setReadyStanceForCommand(const KDL::Twist & command, bool start_with_right);
   KDL::Twist limitCommandRate(const KDL::Twist & current, const KDL::Twist & target, double dt) const;
   KDL::Twist bodyPoseTargetFromCommand(const KDL::Twist & command, bool command_timed_out) const;

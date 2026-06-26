@@ -65,6 +65,7 @@ void TripodGait::initializeLegs()
     legs_[i].foot_center_position.z(0.0);
     legs_[i].foot_relative_position = KDL::Vector(0.0, 0.0, params_.foot_z_down);
     legs_[i].swing_start_position = legs_[i].foot_relative_position;
+    legs_[i].swing_goal_position = legs_[i].foot_relative_position;
     legs_[i].in_continuous_swing = false;
     legs_[i].joint_angles = KDL::JntArray(kNumJointsPerLeg);
   }
@@ -91,6 +92,7 @@ void TripodGait::reset()
   for (int i = 0; i < kNumLegs; i++) {
     legs_[i].foot_relative_position = rest_pose_targets_[i];
     legs_[i].swing_start_position = legs_[i].foot_relative_position;
+    legs_[i].swing_goal_position = legs_[i].foot_relative_position;
     legs_[i].in_continuous_swing = false;
   }
 }
@@ -212,6 +214,7 @@ void TripodGait::clearContinuousSwingState()
   for (Leg & leg : legs_) {
     leg.in_continuous_swing = false;
     leg.swing_start_position = leg.foot_relative_position;
+    leg.swing_goal_position = leg.foot_relative_position;
   }
 }
 
@@ -506,6 +509,25 @@ bool TripodGait::chooseStartWithRightTripod(const KDL::Twist & command) const
   return right_start_error < left_start_error;
 }
 
+bool TripodGait::readyStanceApplies(const KDL::Twist & command) const
+{
+  const double ready_norm = std::hypot(
+    std::hypot(params_.ready_stance_linear_x, params_.ready_stance_linear_y),
+    params_.ready_stance_angular_z);
+  const double command_norm = std::hypot(
+    std::hypot(command.vel.x(), command.vel.y()),
+    command.rot.z());
+  if (ready_norm < params_.velocity_epsilon || command_norm < params_.velocity_epsilon) {
+    return false;
+  }
+
+  const double dot =
+    command.vel.x() * params_.ready_stance_linear_x +
+    command.vel.y() * params_.ready_stance_linear_y +
+    command.rot.z() * params_.ready_stance_angular_z;
+  return dot / (ready_norm * command_norm) > 0.707;
+}
+
 void TripodGait::setReadyStanceForCommand(
   const KDL::Twist & command,
   const bool start_with_right)
@@ -520,6 +542,7 @@ void TripodGait::setReadyStanceForCommand(
     p.y(swing_leg ? boundary.y() : -boundary.y());
     p.z(params_.foot_z_down);
     legs_[i].swing_start_position = p;
+    legs_[i].swing_goal_position = p;
     legs_[i].in_continuous_swing = false;
   }
 }
@@ -787,7 +810,7 @@ void TripodGait::beginWalkingSequence(const KDL::Twist & command)
   rest_sequence_active_ = false;
   if (stop_state_ != StopState::WALKING && allLegsDown()) {
     const bool start_with_right = chooseStartWithRightTripod(command);
-    if (params_.ready_stance_enabled && allLegsAtRestPose()) {
+    if (params_.ready_stance_enabled && allLegsAtRestPose() && readyStanceApplies(command)) {
       setReadyStanceForCommand(command, start_with_right);
     }
     gait_cycle_phase_ = start_with_right ? 0.5 : 0.0;
@@ -949,8 +972,10 @@ void TripodGait::moveLegsContinuous(
       if (!legs_[i].in_continuous_swing) {
         legs_[i].in_continuous_swing = true;
         legs_[i].swing_start_position = p;
+        legs_[i].swing_goal_position = -getRectangleBoundaryGoal(foot_velocities[i]);
+        clampFootXY(legs_[i].swing_goal_position);
       }
-      const KDL::Vector goal = -getRectangleBoundaryGoal(foot_velocities[i]);
+      const KDL::Vector & goal = legs_[i].swing_goal_position;
       p.x(legs_[i].swing_start_position.x() +
         (goal.x() - legs_[i].swing_start_position.x()) * travel);
       p.y(legs_[i].swing_start_position.y() +
