@@ -80,6 +80,9 @@ public:
     go_to_rest_pose_srv_ = this->create_service<std_srvs::srv::Trigger>(
       "go_to_rest_pose",
       std::bind(&FollowVelocity::goToRestPoseCallback, this, _1, _2));
+    reset_control_srv_ = this->create_service<std_srvs::srv::Trigger>(
+      "/control/reset",
+      std::bind(&FollowVelocity::resetControlCallback, this, _1, _2));
     // Publisher for joint angle references
     actuators_pub_ = this->create_publisher<actuator_msgs::msg::Actuators>(
       "actuators", 1);
@@ -434,6 +437,43 @@ private:
     return KDL::Twist(KDL::Vector(0.0, 0.0, 0.0), KDL::Vector(0.0, 0.0, 0.0));
   }
 
+  void resetLegIkSeeds()
+  {
+    for (int i = 0; i < nb_legs_; i++) {
+      legs_[i].joint_angles = KDL::JntArray(nb_joints_per_leg_);
+      const std::vector<double> & seed =
+        i < nb_legs_ / 2 ? params_.ik_seed_joint_angles_left : params_.ik_seed_joint_angles_right;
+      for (int j = 0; j < nb_joints_per_leg_; j++) {
+        legs_[i].joint_angles(j) = seed[j];
+      }
+    }
+  }
+
+  void resetControllerState()
+  {
+    cmd_vel_ = zeroTwist();
+    cmd_vel_smoothed_ = zeroTwist();
+    body_pose_current_ = zeroTwist();
+    cmd_vel_stamp_ = this->now();
+    heading_hold_active_ = false;
+    body_pose_mode_enabled_ = false;
+    stop_state_ = StopState::HOLDING;
+    rest_sequence_active_ = false;
+    rest_state_ = RestState::HOLDING;
+    gait_cycle_phase_ = 0.0;
+    start_with_right_tripod_ = true;
+    left_phase_ = GaitPhase::DOWN;
+    right_phase_ = GaitPhase::DOWN;
+    last_update_ = steady_clock_.now();
+
+    for (int i = 0; i < nb_legs_; i++) {
+      legs_[i].foot_relative_position = rest_pose_targets_[i];
+      legs_[i].swing_start_position = legs_[i].foot_relative_position;
+      legs_[i].in_continuous_swing = false;
+    }
+    resetLegIkSeeds();
+  }
+
   double getDt()
   {
     const auto now = steady_clock_.now();
@@ -490,6 +530,16 @@ private:
     clearContinuousSwingState();
     response->success = true;
     response->message = "Returning to startup resting pose.";
+  }
+
+  void resetControlCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+  {
+    resetControllerState();
+    response->success = true;
+    response->message = "Controller reset to startup state.";
+    RCLCPP_WARN(this->get_logger(), "Controller reset to startup state.");
   }
 
   KDL::Vector getRectangleBoundaryGoal(const KDL::Vector & direction) const
@@ -1482,6 +1532,8 @@ private:
     body_pose_mode_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr
     go_to_rest_pose_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr
+    reset_control_srv_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
     robot_description_sub_;
   rclcpp::Publisher<actuator_msgs::msg::Actuators>::SharedPtr
