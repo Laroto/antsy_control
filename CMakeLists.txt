@@ -14,6 +14,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(actuator_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(orocos_kdl_vendor REQUIRED)
+find_package(Eigen3 REQUIRED)
 find_package(antsy_kinematics REQUIRED)
 find_package(antsy_msgs REQUIRED)
 
@@ -34,6 +35,20 @@ set(dependencies
 # build #
 #########
 
+add_library(antsy_control_core
+  src/tripod_gait.cpp
+  src/leg_odometry.cpp
+)
+target_include_directories(antsy_control_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(antsy_control_core
+  orocos_kdl_vendor
+)
+target_link_libraries(antsy_control_core
+  Eigen3::Eigen
+)
+
 add_executable(walk_forward
   src/walk_forward.cpp
 )
@@ -48,15 +63,24 @@ add_executable(follow_velocity_rectangle
 target_include_directories(follow_velocity_rectangle PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
+target_link_libraries(follow_velocity_rectangle
+  antsy_control_core
+)
 ament_target_dependencies(follow_velocity_rectangle ${dependencies})
 
 ###########
 # install #
 ###########
 install(TARGETS
+  antsy_control_core
   walk_forward
   follow_velocity_rectangle
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  DIRECTORY include/
+  DESTINATION include
 )
 
 install(
@@ -71,5 +95,7 @@ install(
     launch
   DESTINATION share/${PROJECT_NAME}
 )
+
+ament_export_include_directories(include)
 
 ament_package()
